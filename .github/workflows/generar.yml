@@ -1,0 +1,63 @@
+name: Generar 10 cuentas US PIP
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Levantar la API en localhost
+        run: |
+          nohup python wsgi.py > server.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null http://127.0.0.1:5000/api/health && break
+            sleep 1
+          done
+          echo "servidor arriba"
+
+      - name: Generar cuentas
+        run: |
+          mkdir -p datos
+          [ -s datos/cuentas_us.json ] || echo "[]" > datos/cuentas_us.json
+          for i in $(seq 1 10); do
+            echo "--- intento $i ---"
+            curl -s --max-time 90 \
+              "http://127.0.0.1:5000/api/v1/gen?region=US&count=1&name=PIP" \
+              -o tmp.json || true
+            jq --slurpfile n tmp.json '. + ($n[0].accounts // [])' \
+              datos/cuentas_us.json > merged.json 2>/dev/null \
+              && mv merged.json datos/cuentas_us.json || true
+            sleep 2
+          done
+          jq 'unique_by(.uid)' datos/cuentas_us.json > d.json && mv d.json datos/cuentas_us.json
+          echo "total acumulado: $(jq 'length' datos/cuentas_us.json)"
+
+      - name: Guardar en el repo
+        run: |
+          git config user.name "gen-bot"
+          git config user.email "gen-bot@users.noreply.github.com"
+          git add datos/cuentas_us.json
+          git commit -m "cuentas US PIP $(date -u +%Y-%m-%dT%H:%M:%SZ)" || echo "sin cambios"
+          git push
+
+      - name: Copia de seguridad
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuentas-us-pip
+          path: datos/cuentas_us.json
