@@ -1,4 +1,4 @@
-name: Diagnostico
+name: Diagnostico 2
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
 jobs:
   diag:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -20,23 +20,22 @@ jobs:
         run: |
           nohup python wsgi.py > server.log 2>&1 &
           sleep 8
-          echo "== server.log tras arrancar =="
-          cat server.log
+          curl -s -o /dev/null http://127.0.0.1:5000/api/health
 
-      - name: Sondas
+      - name: Sonda US individual
         run: |
           set +e
-          echo "== health =="
-          curl -s -o - -w "\nHTTP:%{http_code}\n" http://127.0.0.1:5000/api/health
-          echo "== raiz =="
-          curl -s -o - -w "\nHTTP:%{http_code}\n" http://127.0.0.1:5000/api
-          echo "== US =="
-          curl -s --max-time 60 -w "\nHTTP:%{http_code}\n" "http://127.0.0.1:5000/api/v1/gen?region=US&count=1&debug=1"
-          echo "== ID =="
-          curl -s --max-time 60 -w "\nHTTP:%{http_code}\n" "http://127.0.0.1:5000/api/v1/gen?region=ID&count=1&debug=1"
-          echo "== SAC =="
-          curl -s --max-time 60 -w "\nHTTP:%{http_code}\n" "http://127.0.0.1:5000/api/v1/gen?region=SAC&count=1&debug=1"
+          echo "== US count=1 =="
+          curl -s --max-time 200 -w "\nHTTP:%{http_code}\n" \
+            "http://127.0.0.1:5000/api/v1/gen?region=US&count=1&debug=1"
 
-      - name: Volcar log del servidor
+      - name: Sonda US lote
+        run: |
+          set +e
+          echo "== US count=5 =="
+          curl -s --max-time 200 -w "\nHTTP:%{http_code}\n" \
+            "http://127.0.0.1:5000/api/v1/gen?region=US&count=5&debug=1"
+
+      - name: Log servidor
         if: always()
         run: cat server.log
