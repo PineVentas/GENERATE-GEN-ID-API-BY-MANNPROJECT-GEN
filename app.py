@@ -57,6 +57,13 @@ def send_telegram(text):
 _thread_local = threading.local()
 _debug_buffer = []
 _debug_lock = threading.Lock()
+_rl_count = 0
+_rl_lock = threading.Lock()
+
+def _bump_rl():
+    global _rl_count
+    with _rl_lock:
+        _rl_count += 1
 
 def _safe(v):
     if v is None or isinstance(v, (str, int, float, bool)): return v
@@ -79,15 +86,21 @@ def dbg(tag, **fields):
         _debug_buffer.append(f"[{tag}] {line}")
         if len(_debug_buffer) > 200: _debug_buffer.pop(0)
 
-# ========== KONFIG GARENA (UTUH) ==========
+# ========== KONFIG GARENA ==========
 REGION_LANG = {"ME":"ar","IND":"hi","ID":"id","VN":"vi","TH":"th","BD":"bn","PK":"ur","TW":"zh","CIS":"ru","SAC":"es","BR":"pt","SG":"en","MY":"ms","PH":"en","US":"en"}
 HEX_KEY = bytes.fromhex("32656534343831396539623435393838343531343130363762323831363231383734643064356437616639643866376530306331653534373135623764316533")
-OPT = {'timeout': 8, 'retries': 2, 'backoff': 0.05}
-RARITY_SCORE_THRESHOLD = 8
-FIXED_WORKERS = 100
-TARGET_ACC_PER_SEC = 50.0
 
-# ========== IP SPOOFER (UTUH) ==========
+# Rute OAuth yang aktif (verificado por sonda: /api/v2/oauth:register NO existe)
+REGISTER_URL = "https://100067.connect.garena.com/api/v2/oauth/guest:register"
+TOKEN_URL    = "https://100067.connect.garena.com/oauth/guest/token/grant"
+
+OPT = {'timeout': 12, 'retries': 5, 'backoff': 0.35}
+RARITY_SCORE_THRESHOLD = 8
+# 429 es por IP en el limitador de Garena: mas workers = mas 429. Sube por env si hace falta.
+FIXED_WORKERS = int(os.environ.get("WORKERS", "10"))
+TARGET_ACC_PER_SEC = float(os.environ.get("TARGET_APS", "20"))
+
+# ========== IP SPOOFER ==========
 class FastIPSpoofer:
     _IP_POOL, _IP_INDEX, _IP_LOCK = [], 0, threading.Lock()
     @classmethod
@@ -103,7 +116,7 @@ class FastIPSpoofer:
             return ip
 FastIPSpoofer.init_ip_pool(5000)
 
-# ========== DEVICE POOL (UTUH) ==========
+# ========== DEVICE POOL ==========
 class DevicePool:
     _devices, _index, _lock = [], 0, threading.Lock()
     DEVICE_MODELS = [
@@ -253,6 +266,18 @@ def _merge_headers(headers, device=None, rotate_ip=False):
         merged["Forwarded"] = f"for={ip}"
     return merged
 
+def _retry_after(resp, attempt):
+    """Espera el Retry-After del servidor si viene, si no backoff exponencial con jitter."""
+    try:
+        ra = resp.headers.get("Retry-After")
+        if ra:
+            wait = float(ra)
+        else:
+            wait = OPT['backoff'] * (2 ** attempt)
+    except Exception:
+        wait = OPT['backoff'] * (2 ** attempt)
+    time.sleep(min(wait, 12.0) + random.uniform(0, 0.5))
+
 def request_retry(method, url, tag="HTTP", **kwargs):
     sess = get_thread_session()
     for attempt in range(OPT['retries'] + 1):
@@ -262,11 +287,14 @@ def request_retry(method, url, tag="HTTP", **kwargs):
             kwargs['verify'] = False
             resp = sess.request(method, url, **kwargs)
             if resp.status_code in (429, 500, 502, 503, 504, 408, 403):
+                if resp.status_code == 429: _bump_rl()
                 if attempt < OPT['retries']:
+                    _retry_after(resp, attempt)
                     reset_thread_device(); sess = get_thread_session(); continue
             return resp
         except Exception:
             if attempt < OPT['retries']:
+                time.sleep(OPT['backoff'] * (2 ** attempt) + random.uniform(0, 0.4))
                 reset_thread_device(); sess = get_thread_session(); continue
             return None
     return None
@@ -310,7 +338,7 @@ def create_account(region, account_name, password_prefix):
     try:
         rand_part = "".join(random.choices("0123456789ABCDEF", k=16))
         password = f"{password_prefix}_{rand_part}"
-        url = "https://100067.connect.garena.com/api/v2/oauth:register"
+        url = REGISTER_URL
         payload = {"app_id": 100067, "client_type": 2, "password": password, "source": 2}
         body_json = json.dumps(payload, separators=(",", ":"))
         signature = hmac.new(HEX_KEY, body_json.encode("utf-8"), hashlib.sha256).hexdigest()
@@ -326,13 +354,21 @@ def create_account(region, account_name, password_prefix):
 
         resp = request_retry('POST', url, tag="Register", headers=headers, data=body_json)
         if resp and resp.status_code == 200:
-            res = resp.json()
+            try:
+                res = resp.json()
+            except Exception:
+                res = {}
             if "data" in res and "uid" in res["data"]:
                 uid = res["data"]["uid"]
                 dbg("Register.success", uid=uid)
                 return get_token(str(uid), password, region, account_name, password_prefix)
-        
-        dbg("Register.fail", status=getattr(resp, "status_code", None), text=getattr(resp, "text", ""))
+            dbg("Register.badjson", text=getattr(resp, "text", ""))
+            return None
+
+        dbg("Register.fail",
+            status=getattr(resp, "status_code", None),
+            headers=dict(getattr(resp, "headers", {}) or {}),
+            text=getattr(resp, "text", ""))
         return None
     except Exception as e:
         dbg("Register.error", raw=str(e))
@@ -340,36 +376,46 @@ def create_account(region, account_name, password_prefix):
 
 def get_token(uid, password, region, account_name, password_prefix):
     try:
-        url = "https://100067.connect.garena.com/oauth/guest/token/grant"
+        url = TOKEN_URL
         dev = get_thread_device()
         headers = _merge_headers({"Content-Type": "application/x-www-form-urlencoded", "User-Agent": WAFBypass.get_ua()}, device=dev)
-        body = {"uid": uid, "password": password, "response_type": "token", "client_type": "2", "client_secret": HEX_KEY, "client_id": "100067"}
+        body = {"uid": uid, "password": password, "response_type": "token", "client_type": "2", "client_secret": HEX_KEY.decode(), "client_id": "100067"}
 
         resp = request_retry('POST', url, tag="Token", headers=headers, data=body)
-        if resp and resp.status_code == 200 and 'open_id' in resp.json():
-            j = resp.json()
-            open_id = j['open_id']; access_token = j["access_token"]
-            dbg("Token.success", open_id=open_id)
-            
-            keystream = [0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30]
-            encoded = "".join(chr(ord(open_id[i]) ^ keystream[i % len(keystream)]) for i in range(len(open_id)))
-            field = codecs.decode(''.join(c if 32 <= ord(c) <= 126 else f'\\u{ord(c):04x}' for c in encoded), 'unicode_escape').encode('latin1')
-            
-            return major_register(access_token, open_id, field, uid, password, region, account_name, password_prefix)
-        
-        dbg("Token.fail", status=getattr(resp, "status_code", None), text=getattr(resp, "text", ""))
+        if resp and resp.status_code == 200:
+            try:
+                j = resp.json()
+            except Exception:
+                j = {}
+            if 'open_id' in j:
+                open_id = j['open_id']; access_token = j["access_token"]
+                dbg("Token.success", open_id=open_id)
+
+                keystream = [0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30]
+                encoded = "".join(chr(ord(open_id[i]) ^ keystream[i % len(keystream)]) for i in range(len(open_id)))
+                field = codecs.decode(''.join(c if 32 <= ord(c) <= 126 else f'\\u{ord(c):04x}' for c in encoded), 'unicode_escape').encode('latin1')
+
+                return major_register(access_token, open_id, field, uid, password, region, account_name, password_prefix)
+
+        dbg("Token.fail", status=getattr(resp, "status_code", None),
+            headers=dict(getattr(resp, "headers", {}) or {}),
+            text=getattr(resp, "text", ""))
         return None
     except Exception as e:
         dbg("Token.error", raw=str(e))
         return None
 
+def _loginbp(region, path):
+    host = "loginbp.common.ggbluefox.com" if region.upper() in ("ME", "TH") else "loginbp.ppmainecoonghj.com"
+    return f"https://{host}/{path}", host
+
 def major_register(access_token, open_id, field, uid, password, region, account_name, password_prefix):
     try:
-        url = "https://loginbp.ppmainecoonghj.com/MajorRegister" if region.upper() not in ["ME","TH"] else "https://loginbp.common.ggbluefox.com/MajorRegister"
+        url, host = _loginbp(region, "MajorRegister")
         name = generate_random_name(account_name)
         dev = get_thread_device()
         headers = _merge_headers({
-            'Host': 'loginbp.ppmainecoonghj.com', 'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
+            'Host': host, 'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
             'Accept': '*/*', 'Accept-Encoding': 'deflate, gzip', 'Authorization': 'Bearer', 'X-GA': 'v1 1',
             'ReleaseVersion': "OB55", 'Content-Type': 'application/x-www-form-urlencoded', 'X-Unity-Version': '2018.4.12f1',
         }, device=dev)
@@ -379,12 +425,12 @@ def major_register(access_token, open_id, field, uid, password, region, account_
         encrypted = aes_encrypt(payload_bytes.hex())
 
         resp = request_retry('POST', url, tag="MajorRegister", headers=headers, data=encrypted)
-        dbg("MajorRegister.response", status=getattr(resp, "status_code", None), text=getattr(resp, "text", ""))
-        
+        dbg("MajorRegister.response", status=getattr(resp, "status_code", None), text=getattr(resp, "text", "")[:300])
+
         login_result = major_login(uid, password, access_token, open_id, region)
         account_id = login_result.get("account_id", "N/A")
         jwt_token  = login_result.get("jwt_token", "")
-        
+
         if account_id != "N/A":
             if jwt_token and region.upper() != "BR":
                 try: force_region_bind(region, jwt_token)
@@ -420,16 +466,16 @@ def major_login(uid, password, access_token, open_id, region):
             107: b'c8e41b7a93f02d56e1a94c7b8203f5d1',
         }
         data = build_proto(payload_dict)
-        url = "https://loginbp.ppmainecoonghj.com/MajorLogin" if region.upper() not in ["ME", "TH"] else "https://loginbp.common.ggbluefox.com/MajorLogin"
+        url, host = _loginbp(region, "MajorLogin")
         headers = _merge_headers({
-            'Host': 'loginbp.ppmainecoonghj.com', 'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
+            'Host': host, 'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
             'Accept': '*/*', 'Accept-Encoding': 'deflate, gzip', 'Authorization': 'Bearer', 'X-GA': 'v1 1',
             'X-Ga-Sv': '1789534056', 'ReleaseVersion': "OB55", 'Content-Type': 'application/x-www-form-urlencoded', 'X-Unity-Version': '2018.4.12f1',
         }, device=dev)
         enc_hex = encrypt_api(data.hex())
 
         resp = request_retry('POST', url, tag="MajorLogin", headers=headers, data=bytes.fromhex(enc_hex))
-        dbg("MajorLogin.response", status=getattr(resp, "status_code", None), text=getattr(resp, "text", ""))
+        dbg("MajorLogin.response", status=getattr(resp, "status_code", None), text=getattr(resp, "text", "")[:300])
 
         if resp and resp.status_code == 200 and len(resp.text) > 10:
             jwt_start = resp.text.find("eyJ")
@@ -454,12 +500,13 @@ def major_login(uid, password, access_token, open_id, region):
 
 def force_region_bind(region, jwt_token):
     try:
-        url = "https://loginbp.common.ggbluefox.com/ChooseRegion" if region.upper() in ["ME","TH"] else "https://loginbp.ppmainecoonghj.com/ChooseRegion"
+        url, host = _loginbp(region, "ChooseRegion")
         region_code = "RU" if region.upper() == "CIS" else region.upper()
         proto_data = build_proto({1: region_code})
         encrypted = encrypt_api(proto_data.hex())
         dev = get_thread_device()
         headers = _merge_headers({
+            "Host": host,
             "User-Agent": "UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
             "Accept": "*/*", "Accept-Encoding": "deflate, gzip", "X-Ga-Sv": "1789534056",
             "Authorization": f"Bearer {jwt_token}", "X-Ga": "v1 1", "Releaseversion": "OB55",
@@ -479,7 +526,7 @@ def check_rarity(account_data):
     if len(account_id) <= 8 and account_id.isdigit(): score += 5; patterns_found.append("LOW_ID")
     if account_id.isdigit() and len(account_id) > 0: score += 2; patterns_found.append("CLEAN_DIGIT")
     if len(account_id) >= 3 and account_id == account_id[::-1]: score += 6; patterns_found.append("PALINDROME")
-    
+
     if score >= RARITY_SCORE_THRESHOLD:
         rtype = "LEGENDARY" if score >= 20 else "MYTHIC" if score >= 16 else "EPIC" if score >= 12 else "RARE"
         return True, rtype, ",".join(patterns_found[:10]), score
@@ -488,30 +535,29 @@ def check_rarity(account_data):
 def generate_single_account(region, name_prefix, password_prefix, api_name):
     reset_thread_device()
     account_result = create_account(region, name_prefix, password_prefix)
-    
+
     if account_result and account_result.get("account_id", "N/A") != "N/A":
         is_rare, rtype, reason, rscore = check_rarity(account_result)
         account_result["rarity"] = rtype if is_rare else "NORMAL"
         account_result["rarity_score"] = rscore if is_rare else 0
         account_result["patterns"] = reason.split(",") if is_rare else []
-        
-        # ===== TAMBAHAN KITA: HITUNG KV & TELEGRAM =====
+
         total = kv_incr("total")
         kv_incr(f"api:{api_name}")
         kv_incr(f"region:{region}")
         kv_incr(f"date:{datetime.now().strftime('%Y-%m-%d')}")
-        
+
         if total > 0 and total % 100 == 0:
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            text = (f"📊 MANN-PROJECTGEN MILESTONE\n\n"
+            text = (f"MANN-PROJECTGEN MILESTONE\n\n"
                     f"Total Gen: {total}\n"
                     f"API: {api_name.upper()}\n"
                     f"Region: {region.upper()}\n"
                     f"Waktu: {now}\n\n"
-                    f"Status: ONLINE ✅\n"
+                    f"Status: ONLINE\n"
                     f"Engine: Garena Direct OB55")
             send_telegram(text)
-            
+
         return account_result
     return None
 
@@ -527,6 +573,7 @@ def after_request(response):
     return response
 
 def _process_request(api_name):
+    global _rl_count
     if request.method == 'OPTIONS': return make_response('', 200)
     count = request.args.get('count', default=1, type=int)
     name = request.args.get('name', default='MANN', type=str)
@@ -538,10 +585,11 @@ def _process_request(api_name):
     if region not in REGION_LANG: return jsonify({"error": f"invalid region, allowed: {list(REGION_LANG.keys())}"}), 400
 
     _thread_local.debug_enabled = debug
-    
-    max_workers = FIXED_WORKERS if FIXED_WORKERS <= count else count
-    deadline = time.time() + max((count / TARGET_ACC_PER_SEC) * 3, 60)
-    max_attempts = count * 4
+    with _rl_lock: _rl_count = 0
+
+    max_workers = min(FIXED_WORKERS, count)
+    deadline = time.time() + max((count / TARGET_ACC_PER_SEC) * 3, 45)
+    max_attempts = count * 6
 
     accounts, attempts = [], 0
     lock, stop_flag, done_event = threading.Lock(), threading.Event(), threading.Event()
@@ -552,7 +600,7 @@ def _process_request(api_name):
         while not stop_flag.is_set():
             with lock:
                 if len(accounts) >= count or attempts >= max_attempts or time.time() > deadline:
-                    stop_flag.set(); return
+                    stop_flag.set(); done_event.set(); return
                 attempts += 1
             try: acc = generate_single_account(region, name, password, api_name)
             except: acc = None
@@ -565,14 +613,17 @@ def _process_request(api_name):
     t_start = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         for _ in range(max_workers): ex.submit(worker)
-        done_event.wait(timeout=deadline - t_start + 10)
+        done_event.wait(timeout=deadline - t_start + 15)
         stop_flag.set()
     elapsed = time.time() - t_start
 
+    with _rl_lock: rl = _rl_count
+
     res_data = {
-        "success": True, "total_requested": count, "total_created": len(accounts),
+        "success": len(accounts) > 0,
+        "total_requested": count, "total_created": len(accounts),
         "accounts": accounts, "attempts_made": attempts, "workers": max_workers,
-        "elapsed_seconds": round(elapsed, 2), "debug": debug,
+        "rate_limited": rl, "elapsed_seconds": round(elapsed, 2), "debug": debug,
     }
     if debug:
         with _debug_lock: res_data["debug_logs"] = _debug_buffer[-50:]
@@ -581,16 +632,16 @@ def _process_request(api_name):
 @app.route('/', methods=['GET'])
 @app.route('/api', methods=['GET'])
 def index():
-    # TAMPILAN RAPI PLAIN TEXT (TANPA HTML)
     text = f"""
 ==================================================
-  MANN-PROJECTGEN API - v1.0 (OB55)
+  MANN-PROJECTGEN API - v1.1 (OB55)
 ==================================================
 Owner      : {OWNER_NAME}
 WhatsApp   : {OWNER_WA}
 Status     : ONLINE
 KV Active  : {"YES" if HAS_KV else "NO"}
 Telegram   : {"YES" if HAS_TG else "NO"}
+Workers    : {FIXED_WORKERS}
 
 [ ENDPOINT GENERATE ]
 - /api/v1/gen        : Generate Akun (Utama)
@@ -626,7 +677,7 @@ GET /api/v1/gen?region=ID&count=5
 @app.route('/api/status', methods=['GET'])
 @app.route('/api/v1/status', methods=['GET'])
 def status():
-    return jsonify({"status": "online", "owner": OWNER_NAME, "version": "v1.0", "engine": "OB55", "kv": HAS_KV, "telegram": HAS_TG})
+    return jsonify({"status": "online", "owner": OWNER_NAME, "version": "v1.1", "engine": "OB55", "workers": FIXED_WORKERS, "kv": HAS_KV, "telegram": HAS_TG})
 
 @app.route('/api/health', methods=['GET'])
 def health():
@@ -635,7 +686,7 @@ def health():
 @app.route('/api/info', methods=['GET'])
 @app.route('/api/v1/info', methods=['GET'])
 def info():
-    return jsonify({"name": "MANN-PROJECTGEN API", "owner": OWNER_NAME, "whatsapp": OWNER_WA, "regions": list(REGION_LANG.keys()), "version": "v1.0"})
+    return jsonify({"name": "MANN-PROJECTGEN API", "owner": OWNER_NAME, "whatsapp": OWNER_WA, "regions": list(REGION_LANG.keys()), "version": "v1.1"})
 
 @app.route('/api/stats', methods=['GET'])
 @app.route('/api/v1/stats', methods=['GET'])
