@@ -1,4 +1,4 @@
-import json, hmac, hashlib, random, base64, codecs, requests, urllib3
+import json, hmac, hashlib, random, requests, urllib3
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 urllib3.disable_warnings()
@@ -63,6 +63,8 @@ def H(**kw):
     h.update(kw)
     return h
 
+def rnd(n): return "".join(random.choices("ABCDEF0123456789", k=n))
+
 # ---- 1. REGISTER ----
 pw = f"Pass_{random.randrange(16**8):08X}"
 body = json.dumps({"app_id":100067,"client_type":2,"password":pw,"source":2}, separators=(",",":"))
@@ -86,16 +88,28 @@ j = r.json()
 open_id, at = j["open_id"], j["access_token"]
 print(f"    open_id={open_id[:24]}... at_len={len(at)}")
 
-# ---- 3. MAJOR REGISTER ----
-name = "MANN" + "".join(random.choices("ABCDEF0123456789", k=6))
-msg = {1:name,2:at,3:open_id,5:102000007,6:4,7:1,13:1,14:f14(open_id),15:LANG,16:2,20:"2.132.4",21:1,22:FIELD_22}
-r = requests.post("https://loginbp.ppmainecoonghj.com/MajorRegister",
-                  headers={"Host":"loginbp.ppmainecoonghj.com","User-Agent":"UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
-                           "Accept":"*/*","Accept-Encoding":"deflate, gzip","Authorization":"Bearer","X-GA":"v1 1",
-                           "ReleaseVersion":"OB55","Content-Type":"application/x-www-form-urlencoded","X-Unity-Version":"2018.4.12f1",
-                           "X-Forwarded-For":IP},
-                  data=bytes.fromhex(enc(proto(msg).hex())), timeout=15, verify=False)
-print(f"[3 MAJORREGISTER] {r.status_code} len={len(r.content)} :: {r.text[:300]!r}")
+# ---- 3. MAJOR REGISTER (nombre PIP + descripcion, con fallback a PIP normal) ----
+CANDIDATOS = [("PIPMELHOR" + rnd(3), "PIP + descripcion"), ("PIP" + rnd(6), "PIP normal")]
+name = None
+for cand, etiqueta in CANDIDATOS:
+    msg = {1:cand,2:at,3:open_id,5:102000007,6:4,7:1,13:1,14:f14(open_id),15:LANG,16:2,20:"2.132.4",21:1,22:FIELD_22}
+    r = requests.post("https://loginbp.ppmainecoonghj.com/MajorRegister",
+                      headers={"Host":"loginbp.ppmainecoonghj.com",
+                               "User-Agent":"UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+                               "Accept":"*/*","Accept-Encoding":"deflate, gzip","Authorization":"Bearer","X-GA":"v1 1",
+                               "ReleaseVersion":"OB55","Content-Type":"application/x-www-form-urlencoded",
+                               "X-Unity-Version":"2018.4.12f1","X-Forwarded-For":IP},
+                      data=bytes.fromhex(enc(proto(msg).hex())), timeout=15, verify=False)
+    print(f"[3 MAJORREGISTER {etiqueta}] nombre={cand} -> {r.status_code} len={len(r.content)} :: {r.text[:200]!r}")
+    if r.status_code == 200:
+        name = cand
+        break
+    print("    rechazado, probando el siguiente formato")
+
+if not name:
+    print("### ningun formato de nombre aceptado")
+else:
+    print(f"### nombre aceptado: {name}")
 
 # ---- 4. MAJOR LOGIN ----
 lp = {3:"2026-11-08 00:00:00",4:b"free fire",5:1,7:"2.132.4",8:"Android OS 12 / API-31 (SP1A.210812.016)",9:b"Handheld",
@@ -112,7 +126,8 @@ lp = {3:"2026-11-08 00:00:00",4:b"free fire",5:1,7:"2.132.4",8:"Android OS 12 / 
       106:b"https://dl.cdn.freefiremobile.com/live/ABHotUpdates/|https://dl-core.cdn.freefiremobile.com/live/ABHotUpdates/|6b2078db9d22dd98f8e9386a39af8462",
       107:b"c8e41b7a93f02d56e1a94c7b8203f5d1"}
 r = requests.post("https://loginbp.ppmainecoonghj.com/MajorLogin",
-                  headers={"Host":"loginbp.ppmainecoonghj.com","User-Agent":"UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+                  headers={"Host":"loginbp.ppmainecoonghj.com",
+                           "User-Agent":"UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
                            "Accept":"*/*","Accept-Encoding":"deflate, gzip","Authorization":"Bearer","X-GA":"v1 1",
                            "X-Ga-Sv":"1789534056","ReleaseVersion":"OB55","Content-Type":"application/x-www-form-urlencoded",
                            "X-Unity-Version":"2018.4.12f1","X-Forwarded-For":IP},
@@ -120,4 +135,5 @@ r = requests.post("https://loginbp.ppmainecoonghj.com/MajorLogin",
 print(f"[4 MAJORLOGIN] {r.status_code} len={len(r.content)}")
 print(f"    jwt_present={'eyJ' in r.text}")
 print(f"    head={r.text[:200]!r}")
-print(f"\n### RESULTADO uid={uid} pw={pw} name={name} region={REGION}")
+
+print(f"\n### RESULTADO uid={uid} pw={pw} name={name} region={REGION} desc=PIP melhor")
