@@ -1,0 +1,36 @@
+name: Gen US
+
+on:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "Cuantas cuentas (recomendado 30, max ~60)"
+        default: "30"
+      prefix:
+        description: "Prefijo del nombre"
+        default: "PIP"
+      workers:
+        description: "Concurrencia (recomendado 4)"
+        default: "4"
+
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Generar
+        run: python gen_us.py
+        env:
+          COUNT: ${{ inputs.count }}
+          NAME_PREFIX: ${{ inputs.prefix }}
+          WORKERS: ${{ inputs.workers }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: accounts-us
+          path: accounts_us.txt
