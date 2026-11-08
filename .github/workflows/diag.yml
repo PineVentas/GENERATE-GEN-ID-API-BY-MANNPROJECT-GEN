@@ -1,0 +1,42 @@
+name: Diagnostico
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      - name: Arrancar servidor
+        run: |
+          nohup python wsgi.py > server.log 2>&1 &
+          sleep 8
+          echo "== server.log tras arrancar =="
+          cat server.log
+
+      - name: Sondas
+        run: |
+          set +e
+          echo "== health =="
+          curl -s -o - -w "\nHTTP:%{http_code}\n" http://127.0.0.1:5000/api/health
+          echo "== raiz =="
+          curl -s -o - -w "\nHTTP:%{http_code}\n" http://127.0.0.1:5000/api
+          echo "== US =="
+          curl -s --max-time 60 -w "\nHTTP:%{http_code}\n" "http://127.0.0.1:5000/api/v1/gen?region=US&count=1&debug=1"
+          echo "== ID =="
+          curl -s --max-time 60 -w "\nHTTP:%{http_code}\n" "http://127.0.0.1:5000/api/v1/gen?region=ID&count=1&debug=1"
+          echo "== SAC =="
+          curl -s --max-time 60 -w "\nHTTP:%{http_code}\n" "http://127.0.0.1:5000/api/v1/gen?region=SAC&count=1&debug=1"
+
+      - name: Volcar log del servidor
+        if: always()
+        run: cat server.log
