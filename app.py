@@ -59,11 +59,18 @@ _debug_buffer = []
 _debug_lock = threading.Lock()
 _rl_count = 0
 _rl_lock = threading.Lock()
+_forbidden_count = 0
+_forbidden_lock = threading.Lock()
 
 def _bump_rl():
     global _rl_count
     with _rl_lock:
         _rl_count += 1
+
+def _bump_forbidden():
+    global _forbidden_count
+    with _forbidden_lock:
+        _forbidden_count += 1
 
 def _safe(v):
     if v is None or isinstance(v, (str, int, float, bool)): return v
@@ -87,10 +94,10 @@ def dbg(tag, **fields):
         if len(_debug_buffer) > 200: _debug_buffer.pop(0)
 
 # ========== KONFIG GARENA ==========
-REGION_LANG = {"ME":"ar","IND":"hi","ID":"id","VN":"vi","TH":"th","BD":"bn","PK":"ur","TW":"zh","CIS":"ru","SAC":"es","BR":"pt","SG":"en","MY":"ms","PH":"en","US":"en"}
+REGION_LANG = {"ME":"ar","IND":"hi","ID":"id","VN":"vi","TH":"th","BD":"bn","PK":"ur","TW":"zh","CIS":"ru","RU":"ru","SAC":"es","BR":"pt","SG":"en","MY":"ms","PH":"en","US":"en"}
 HEX_KEY = bytes.fromhex("32656534343831396539623435393838343531343130363762323831363231383734643064356437616639643866376530306331653534373135623764316533")
 
-# Rute OAuth yang aktif (verificado por sonda: /api/v2/oauth:register NO existe)
+# Rute OAuth yang activo (verificado por sonda: /api/v2/oauth:register NO existe)
 REGISTER_URL = "https://100067.connect.garena.com/api/v2/oauth/guest:register"
 TOKEN_URL    = "https://100067.connect.garena.com/oauth/guest/token/grant"
 
@@ -99,22 +106,43 @@ RARITY_SCORE_THRESHOLD = 8
 # 429 es por IP en el limitador de Garena: mas workers = mas 429. Sube por env si hace falta.
 FIXED_WORKERS = int(os.environ.get("WORKERS", "10"))
 TARGET_ACC_PER_SEC = float(os.environ.get("TARGET_APS", "20"))
+# Reintentos del MajorRegister con dispositivo/IP nuevos antes de descartar la cuenta.
+REG_ATTEMPTS = int(os.environ.get("REG_ATTEMPTS", "3"))
 
-# ========== IP SPOOFER ==========
+# ========== IP SPOOFER (POR REGION) ==========
+# X-Forwarded-For solo es una sugerencia, pero loginbp la honra y valida pais.
+# Por eso el pool debe corresponder a la region pedida: una IP BR con region=US
+# devuelve 400 BR_IP_FORBIDDEN_REGISTER y la cuenta muere en MajorRegister.
 class FastIPSpoofer:
-    _IP_POOL, _IP_INDEX, _IP_LOCK = [], 0, threading.Lock()
+    _PREFIX = {
+        "ID":  ("36.66","36.68","36.72","36.85","36.88","36.90","110.136","110.137","114.122","114.124","180.241","180.244","202.152","103.10"),
+        "IND": ("49.36","49.37","103.87","115.114","122.161","106.51"),
+        "SG":  ("116.12","118.189","175.156","219.74","128.199","139.59","165.22"),
+        "MY":  ("115.164","175.139","60.48","118.100","124.13","202.186"),
+        "PH":  ("112.198","112.201","120.28","49.145","110.54","122.2","203.177"),
+        "TH":  ("49.228","49.237","171.100","184.22","110.164","203.150","27.55"),
+        "VN":  ("113.161","113.171","171.244","27.72","116.96","42.112","14.161"),
+        "BD":  ("103.230","103.108","119.30","103.4","202.134","27.147"),
+        "PK":  ("39.40","39.57","103.255","119.73","202.83","39.32"),
+        "TW":  ("1.34","1.161","36.226","111.250","114.32","61.216"),
+        "CIS": ("95.24","95.108","178.176","188.170","31.173","46.188","5.16"),
+        "RU":  ("95.24","95.108","178.176","188.170","31.173","46.188","5.16"),
+        "SAC": ("190.60","181.48","200.87","190.14","186.84","181.64"),
+        "ME":  ("37.9","37.236","5.156","94.200","185.93","213.158"),
+        "BR":  ("45.112","177.54","177.129","189.34","191.6","201.17","187.17","179.108"),
+        "US":  ("3.80","3.208","4.14","20.0","34.192","52.0","54.208","104.28","172.58","173.245"),
+    }
+    _DEFAULT = _PREFIX["US"]
+    _INDEX, _LOCK = {}, threading.Lock()
+
     @classmethod
-    def init_ip_pool(cls, count=5000):
-        if not cls._IP_POOL:
-            r = random.randint
-            for _ in range(count): cls._IP_POOL.append(f"{r(1,254)}.{r(0,255)}.{r(0,255)}.{r(1,254)}")
-    @classmethod
-    def get_ip(cls):
-        with cls._IP_LOCK:
-            ip = cls._IP_POOL[cls._IP_INDEX % len(cls._IP_POOL)]
-            cls._IP_INDEX += 1
-            return ip
-FastIPSpoofer.init_ip_pool(5000)
+    def get_ip(cls, region="US"):
+        pool = cls._PREFIX.get((region or "US").upper(), cls._DEFAULT)
+        with cls._LOCK:
+            i = cls._INDEX.get(region, 0)
+            cls._INDEX[region] = i + 1
+            pref = pool[i % len(pool)]
+        return f"{pref}.{random.randint(0, 255)}.{random.randint(1, 254)}"
 
 # ========== DEVICE POOL ==========
 class DevicePool:
@@ -244,24 +272,24 @@ FIELD_22 = bytes.fromhex(
 
 class WAFBypass:
     @staticmethod
-    def get_ua():
+    def get_ua(region=None):
         dev = random.choice(DevicePool.DEVICE_MODELS)[0]
         android_full, ver, api = random.choice(DevicePool.ANDROID_VERSIONS)
         sdk = random.choice(DevicePool.SDK_VER)
-        lang = random.choice(["en", "id", "ar", "hi", "vi", "th", "pt", "ru", "es", "bn", "ur", "zh"])
-        reg = random.choice(["ID", "SG", "US", "BR", "ME", "IN", "TH", "VN", "PK", "BD", "TW", "CIS"])
+        reg = (region or "US").upper()
+        lang = REGION_LANG.get(reg) or random.choice(["en", "id", "ar", "hi", "vi", "th", "pt", "ru", "es", "bn", "ur", "zh"])
         return f"GarenaMSDK/{sdk}({dev};Android {ver};{lang};{reg};)"
 
 session = requests.Session()
 _IP_HEADER_KEYS = ("X-Forwarded-For", "X-Real-IP", "X-Client-IP", "CF-Connecting-IP", "True-Client-IP")
 
-def _merge_headers(headers, device=None, rotate_ip=False):
+def _merge_headers(headers, device=None, rotate_ip=False, region="US"):
     if headers is None: headers = {}
     merged = dict(headers)
     dev_h = DevicePool.headers(device) if device is not None else get_thread_dev_headers()
     for k, v in dev_h.items(): merged.setdefault(k, v)
     if rotate_ip or "X-Forwarded-For" not in merged:
-        ip = FastIPSpoofer.get_ip()
+        ip = FastIPSpoofer.get_ip(region)
         for k in _IP_HEADER_KEYS: merged[k] = ip
         merged["Forwarded"] = f"for={ip}"
     return merged
@@ -278,22 +306,37 @@ def _retry_after(resp, attempt):
         wait = OPT['backoff'] * (2 ** attempt)
     time.sleep(min(wait, 12.0) + random.uniform(0, 0.5))
 
-def request_retry(method, url, tag="HTTP", **kwargs):
+_RETRY_STATUS = (429, 500, 502, 503, 504, 408, 403)
+
+def _is_retryable(resp):
+    if resp.status_code in _RETRY_STATUS:
+        return True
+    # 400 con cuerpo FORBIDDEN = rechazo por geo del X-Forwarded-For, no por payload.
+    if resp.status_code == 400:
+        try: body = resp.content or b""
+        except Exception: body = b""
+        if b"FORBIDDEN" in body:
+            _bump_forbidden()
+            return True
+    return False
+
+def request_retry(method, url, tag="HTTP", region="US", retries=None, **kwargs):
     sess = get_thread_session()
-    for attempt in range(OPT['retries'] + 1):
+    limit = OPT['retries'] if retries is None else retries
+    for attempt in range(limit + 1):
         try:
             kwargs.setdefault('timeout', OPT['timeout'])
-            kwargs['headers'] = _merge_headers(kwargs.get('headers'), rotate_ip=(attempt > 0))
+            kwargs['headers'] = _merge_headers(kwargs.get('headers'), rotate_ip=(attempt > 0), region=region)
             kwargs['verify'] = False
             resp = sess.request(method, url, **kwargs)
-            if resp.status_code in (429, 500, 502, 503, 504, 408, 403):
+            if _is_retryable(resp):
                 if resp.status_code == 429: _bump_rl()
-                if attempt < OPT['retries']:
+                if attempt < limit:
                     _retry_after(resp, attempt)
                     reset_thread_device(); sess = get_thread_session(); continue
             return resp
         except Exception:
-            if attempt < OPT['retries']:
+            if attempt < limit:
                 time.sleep(OPT['backoff'] * (2 ** attempt) + random.uniform(0, 0.4))
                 reset_thread_device(); sess = get_thread_session(); continue
             return None
@@ -346,13 +389,13 @@ def create_account(region, account_name, password_prefix):
         dbg("Register.request", url=url, body=body_json, signature=signature)
         dev = get_thread_device()
         headers = _merge_headers({
-            "User-Agent": WAFBypass.get_ua(),
+            "User-Agent": WAFBypass.get_ua(region),
             "Connection": "Keep-Alive", "Accept": "application/json", "Accept-Encoding": "gzip",
             "Authorization": f"Signature {signature}", "Content-Type": "application/json; charset=utf-8",
             "Host": "100067.connect.garena.com",
-        }, device=dev)
+        }, device=dev, region=region)
 
-        resp = request_retry('POST', url, tag="Register", headers=headers, data=body_json)
+        resp = request_retry('POST', url, tag="Register", region=region, headers=headers, data=body_json)
         if resp and resp.status_code == 200:
             try:
                 res = resp.json()
@@ -378,10 +421,10 @@ def get_token(uid, password, region, account_name, password_prefix):
     try:
         url = TOKEN_URL
         dev = get_thread_device()
-        headers = _merge_headers({"Content-Type": "application/x-www-form-urlencoded", "User-Agent": WAFBypass.get_ua()}, device=dev)
+        headers = _merge_headers({"Content-Type": "application/x-www-form-urlencoded", "User-Agent": WAFBypass.get_ua(region)}, device=dev, region=region)
         body = {"uid": uid, "password": password, "response_type": "token", "client_type": "2", "client_secret": HEX_KEY.decode(), "client_id": "100067"}
 
-        resp = request_retry('POST', url, tag="Token", headers=headers, data=body)
+        resp = request_retry('POST', url, tag="Token", region=region, headers=headers, data=body)
         if resp and resp.status_code == 200:
             try:
                 j = resp.json()
@@ -406,26 +449,53 @@ def get_token(uid, password, region, account_name, password_prefix):
         return None
 
 def _loginbp(region, path):
-    host = "loginbp.common.ggbluefox.com" if region.upper() in ("ME", "TH") else "loginbp.ppmainecoonghj.com"
+    r = (region or "US").upper()
+    if r == "BR":
+        host = "loginbp.ggpolarbear.com"        # infra BR: no acepta IP de otro pais ni region BR en host US
+    elif r in ("ME", "TH"):
+        host = "loginbp.common.ggbluefox.com"
+    else:
+        host = "loginbp.ppmainecoonghj.com"
     return f"https://{host}/{path}", host
 
 def major_register(access_token, open_id, field, uid, password, region, account_name, password_prefix):
     try:
         url, host = _loginbp(region, "MajorRegister")
         name = generate_random_name(account_name)
-        dev = get_thread_device()
-        headers = _merge_headers({
-            'Host': host, 'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
-            'Accept': '*/*', 'Accept-Encoding': 'deflate, gzip', 'Authorization': 'Bearer', 'X-GA': 'v1 1',
-            'ReleaseVersion': "OB55", 'Content-Type': 'application/x-www-form-urlencoded', 'X-Unity-Version': '2018.4.12f1',
-        }, device=dev)
         lang = REGION_LANG.get(region.upper(), "en")
         reg_msg = {1: name, 2: access_token, 3: open_id, 5: 102000007, 6: 4, 7: 1, 13: 1, 14: encode_f14(open_id), 15: lang, 16: 2, 20: "2.132.4", 21: 1, 22: FIELD_22}
-        payload_bytes = build_proto(reg_msg)
-        encrypted = aes_encrypt(payload_bytes.hex())
+        encrypted = aes_encrypt(build_proto(reg_msg).hex())
 
-        resp = request_retry('POST', url, tag="MajorRegister", headers=headers, data=encrypted)
-        dbg("MajorRegister.response", status=getattr(resp, "status_code", None), text=getattr(resp, "text", "")[:300])
+        ok = False
+        for attempt in range(REG_ATTEMPTS):
+            dev = get_thread_device()
+            headers = _merge_headers({
+                'Host': host, 'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
+                'Accept': '*/*', 'Accept-Encoding': 'deflate, gzip', 'Authorization': 'Bearer', 'X-GA': 'v1 1',
+                'ReleaseVersion': "OB55", 'Content-Type': 'application/x-www-form-urlencoded', 'X-Unity-Version': '2018.4.12f1',
+            }, device=dev, rotate_ip=True, region=region)
+
+            resp = request_retry('POST', url, tag="MajorRegister", region=region, retries=2, headers=headers, data=encrypted)
+            status = getattr(resp, "status_code", None)
+            rtext = getattr(resp, "text", "") or ""
+            dbg("MajorRegister.response", attempt=attempt, status=status, text=rtext[:300])
+
+            if status == 200:
+                ok = True
+                break
+
+            # 400/403 aqui = geo o nombre rechazado, no token invalido: vale reintentar con
+            # otro dispositivo e IP de la misma region. BR_IP_FORBIDDEN_REGISTER cae aca.
+            if status in (400, 403):
+                reset_thread_device()
+                continue
+            break
+
+        if not ok:
+            # Sin MajorRegister no existe cuenta de juego: MajorLogin daria 404 y solo
+            # gastaria un request. Se descarta la cuenta aqui y se reporta la causa.
+            dbg("MajorRegister.abort", reason="no_200", status=getattr(resp, "status_code", None))
+            return None
 
         login_result = major_login(uid, password, access_token, open_id, region)
         account_id = login_result.get("account_id", "N/A")
@@ -446,7 +516,7 @@ def major_login(uid, password, access_token, open_id, region):
         lang = REGION_LANG.get(region.upper(), "en")
         dev  = get_thread_device()
         gpu_full, gpu, model, os_str, operator, network, device_uuid, cpu = dev["_gpu_full"], dev["gpu"], dev["model"], dev["android_full"], dev["operator"], dev["network"], dev["uuid"], dev["cpu"]
-        ip_addr = FastIPSpoofer.get_ip()
+        ip_addr = FastIPSpoofer.get_ip(region)
 
         open_id_b = open_id.encode() if isinstance(open_id, str) else open_id
         access_token_b = access_token.encode() if isinstance(access_token, str) else access_token
@@ -471,10 +541,10 @@ def major_login(uid, password, access_token, open_id, region):
             'Host': host, 'User-Agent': 'UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)',
             'Accept': '*/*', 'Accept-Encoding': 'deflate, gzip', 'Authorization': 'Bearer', 'X-GA': 'v1 1',
             'X-Ga-Sv': '1789534056', 'ReleaseVersion': "OB55", 'Content-Type': 'application/x-www-form-urlencoded', 'X-Unity-Version': '2018.4.12f1',
-        }, device=dev)
+        }, device=dev, rotate_ip=True, region=region)
         enc_hex = encrypt_api(data.hex())
 
-        resp = request_retry('POST', url, tag="MajorLogin", headers=headers, data=bytes.fromhex(enc_hex))
+        resp = request_retry('POST', url, tag="MajorLogin", region=region, headers=headers, data=bytes.fromhex(enc_hex))
         dbg("MajorLogin.response", status=getattr(resp, "status_code", None), text=getattr(resp, "text", "")[:300])
 
         if resp and resp.status_code == 200 and len(resp.text) > 10:
@@ -511,8 +581,8 @@ def force_region_bind(region, jwt_token):
             "Accept": "*/*", "Accept-Encoding": "deflate, gzip", "X-Ga-Sv": "1789534056",
             "Authorization": f"Bearer {jwt_token}", "X-Ga": "v1 1", "Releaseversion": "OB55",
             "Content-Type": "application/x-www-form-urlencoded", "X-Unity-Version": "2018.4.12f1"
-        }, device=dev)
-        request_retry('POST', url, tag="ForceRegionBind", data=bytes.fromhex(encrypted), headers=headers)
+        }, device=dev, rotate_ip=True, region=region)
+        request_retry('POST', url, tag="ForceRegionBind", region=region, data=bytes.fromhex(encrypted), headers=headers)
     except: pass
 
 def generate_random_name(name_prefix): return name_prefix + ''.join(random.choices(string.ascii_letters + string.digits, k=6)).upper()
@@ -573,7 +643,7 @@ def after_request(response):
     return response
 
 def _process_request(api_name):
-    global _rl_count
+    global _rl_count, _forbidden_count
     if request.method == 'OPTIONS': return make_response('', 200)
     count = request.args.get('count', default=1, type=int)
     name = request.args.get('name', default='MANN', type=str)
@@ -586,6 +656,7 @@ def _process_request(api_name):
 
     _thread_local.debug_enabled = debug
     with _rl_lock: _rl_count = 0
+    with _forbidden_lock: _forbidden_count = 0
 
     max_workers = min(FIXED_WORKERS, count)
     deadline = time.time() + max((count / TARGET_ACC_PER_SEC) * 3, 45)
@@ -618,12 +689,14 @@ def _process_request(api_name):
     elapsed = time.time() - t_start
 
     with _rl_lock: rl = _rl_count
+    with _forbidden_lock: fb = _forbidden_count
 
     res_data = {
         "success": len(accounts) > 0,
         "total_requested": count, "total_created": len(accounts),
         "accounts": accounts, "attempts_made": attempts, "workers": max_workers,
-        "rate_limited": rl, "elapsed_seconds": round(elapsed, 2), "debug": debug,
+        "rate_limited": rl, "ip_forbidden": fb,
+        "elapsed_seconds": round(elapsed, 2), "debug": debug,
     }
     if debug:
         with _debug_lock: res_data["debug_logs"] = _debug_buffer[-50:]
@@ -634,7 +707,7 @@ def _process_request(api_name):
 def index():
     text = f"""
 ==================================================
-  MANN-PROJECTGEN API - v1.1 (OB55)
+  MANN-PROJECTGEN API - v1.2 (OB55)
 ==================================================
 Owner      : {OWNER_NAME}
 WhatsApp   : {OWNER_WA}
@@ -642,6 +715,8 @@ Status     : ONLINE
 KV Active  : {"YES" if HAS_KV else "NO"}
 Telegram   : {"YES" if HAS_TG else "NO"}
 Workers    : {FIXED_WORKERS}
+IP Spoof   : POR REGION (coherente con region=)
+Reg Attempts: {REG_ATTEMPTS}
 
 [ ENDPOINT GENERATE ]
 - /api/v1/gen        : Generate Akun (Utama)
@@ -670,6 +745,10 @@ Workers    : {FIXED_WORKERS}
 [ CARA PAKAI ]
 GET /api/v1/gen?region=ID
 GET /api/v1/gen?region=ID&count=5
+
+[ CATATAN ]
+ip_forbidden > 0 = Garena rechazo la geo del X-Forwarded-For.
+region=BR usa loginbp.ggpolarbear.com y no aplica ChooseRegion.
 ==================================================
 """
     return make_response(text, 200, {'Content-Type': 'text/plain; charset=utf-8'})
@@ -677,7 +756,7 @@ GET /api/v1/gen?region=ID&count=5
 @app.route('/api/status', methods=['GET'])
 @app.route('/api/v1/status', methods=['GET'])
 def status():
-    return jsonify({"status": "online", "owner": OWNER_NAME, "version": "v1.1", "engine": "OB55", "workers": FIXED_WORKERS, "kv": HAS_KV, "telegram": HAS_TG})
+    return jsonify({"status": "online", "owner": OWNER_NAME, "version": "v1.2", "engine": "OB55", "workers": FIXED_WORKERS, "reg_attempts": REG_ATTEMPTS, "ip_mode": "region", "kv": HAS_KV, "telegram": HAS_TG})
 
 @app.route('/api/health', methods=['GET'])
 def health():
@@ -686,7 +765,7 @@ def health():
 @app.route('/api/info', methods=['GET'])
 @app.route('/api/v1/info', methods=['GET'])
 def info():
-    return jsonify({"name": "MANN-PROJECTGEN API", "owner": OWNER_NAME, "whatsapp": OWNER_WA, "regions": list(REGION_LANG.keys()), "version": "v1.1"})
+    return jsonify({"name": "MANN-PROJECTGEN API", "owner": OWNER_NAME, "whatsapp": OWNER_WA, "regions": list(REGION_LANG.keys()), "version": "v1.2"})
 
 @app.route('/api/stats', methods=['GET'])
 @app.route('/api/v1/stats', methods=['GET'])
