@@ -26,9 +26,13 @@ jobs:
       - name: Generar
         run: python gen_us.py
         env:
-          COUNT: ${{ inputs.count }}
-          NAME_PREFIX: ${{ inputs.prefix }}
-          WORKERS: ${{ inputs.workers }}
+        COUNT: 3
+        NAME_PREFIX: kick
+        WORKERS: 1
+        REGION: US
+        LOCK_FIELD: "4"
+        VERBOSE: "1"
+        OUT_FILE: accounts_us.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
