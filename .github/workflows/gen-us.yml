@@ -27,7 +27,7 @@ jobs:
       COUNT: ${{ inputs.count || '5' }}
       NAME_PREFIX: ${{ inputs.prefix || 'PIP' }}
       WORKERS: ${{ inputs.workers || '2' }}
-      REGION: US
+      REGION: SAC
       LOCK_FIELD: "4"
       TIMEOUT: "20"
       RETRIES: "3"
