@@ -4,78 +4,53 @@ on:
   workflow_dispatch:
     inputs:
       count:
-        description: "Cuantas cuentas (recomendado 30, max ~60)"
-        required: false
-        default: "30"
+        description: "Cuantas cuentas US"
+        default: "5"
         type: string
       prefix:
-        description: "Prefijo del nombre"
-        required: false
+        description: "Prefijo"
         default: "PIP"
         type: string
       workers:
-        description: "Concurrencia (recomendado 4)"
-        required: false
-        default: "4"
+        description: "Concurrencia (2 al principio)"
+        default: "2"
         type: string
-      verbose:
-        description: "Log detallado (1 = si, 0 = no)"
-        required: false
-        default: "0"
-        type: choice
-        options:
-          - "0"
-          - "1"
 
 permissions:
   contents: read
-
-concurrency:
-  group: gen-us
-  cancel-in-progress: false
 
 jobs:
   gen:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      COUNT: "5"            # prueba corta primero
-      WORKERS: "2"          # 2, no 4: una sola IP
+      COUNT: ${{ inputs.count || '5' }}
+      NAME_PREFIX: ${{ inputs.prefix || 'PIP' }}
+      WORKERS: ${{ inputs.workers || '2' }}
+      REGION: US
+      LOCK_FIELD: "4"
       TIMEOUT: "20"
       RETRIES: "3"
-      HOST_US: loginbp.ppmainecoonghj.com
+      OUT_FILE: accounts_us.txt
+      PYTHONUNBUFFERED: "1"
+      PROXY: ${{ secrets.PROXY }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-
-      - name: Instalar dependencias
-        run: pip install -r requirements.txt
-
+      - run: pip install -r requirements.txt
       - name: Generar
-        run: |
-          echo "objetivo=$COUNT prefijo=$NAME_PREFIX workers=$WORKERS region=$REGION"
-          python gen_us.py
-        env:
-          VERBOSE: ${{ inputs.verbose == '1' && '1' || '' }}
-
+        run: python gen_us.py
       - name: Resumen
         if: always()
         run: |
           if [ -s "$OUT_FILE" ]; then
-            {
-              echo "### Cuentas generadas: $(wc -l < "$OUT_FILE")"
-              echo '```'
-              cat "$OUT_FILE"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+            { echo "### US: $(wc -l < "$OUT_FILE")"; echo '```'; cat "$OUT_FILE"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "Sin cuentas generadas (revisa el log del paso Generar)." >> "$GITHUB_STEP_SUMMARY"
+            echo "Sin cuentas. Ver fallos por paso en el log." >> "$GITHUB_STEP_SUMMARY"
           fi
-
       - uses: actions/upload-artifact@v4
         if: always()
         with:
