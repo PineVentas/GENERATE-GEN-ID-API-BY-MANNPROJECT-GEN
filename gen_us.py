@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Genera cuentas Free Fire region US. Salida: accounts_us.txt (uid|pass|name|account_id)."""
+"""Genera cuentas Free Fire por region. Salida: accounts_<region>.txt (uid|pass|name|account_id).
+
+Variables de entorno:
+  REGION      US | SAC | BR        (default US)
+  LOCK_FIELD  campo protobuf de lock_region en MajorRegister (default 4) -> hay que probarlo
+  PROXY       http://user:pass@ip:puerto para salir por IP de la region (opcional)
+  COUNT, NAME_PREFIX, WORKERS, OUT_FILE
+  HOST_US / HOST_SAC / HOST_BR   override de host
+"""
 import os, sys, json, time, random, string, hmac, hashlib, codecs, base64, threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -11,12 +19,29 @@ urllib3.disable_warnings()
 
 COUNT   = int(os.environ.get("COUNT", "30"))
 PREFIX  = os.environ.get("NAME_PREFIX", "PIP")
-WORKERS = max(1, int(os.environ.get("WORKERS", "4")))
-OUT     = os.environ.get("OUT_FILE", "accounts_us.txt")
+WORKERS = max(1, int(os.environ.get("WORKERS", "2")))
 
-REGION, LANG = "US", "en"
-UA = "GarenaMSDK/4.0.42(SM-A525F;Android 12;en;US;)"
-HOST = "loginbp.ppmainecoonghj.com"
+REGION = os.environ.get("REGION", "US").upper()
+if REGION not in ("US", "SAC", "BR"):
+    print(f"REGION invalida: {REGION} (usa US, SAC o BR)"); sys.exit(2)
+LANG = {"US": "en", "SAC": "es", "BR": "pt"}.get(REGION, "en")
+
+OUT = os.environ.get("OUT_FILE", f"accounts_{REGION.lower()}.txt")
+
+HOSTS = {
+    "US":  os.environ.get("HOST_US",  "login.us.freefiremobile.com"),
+    "SAC": os.environ.get("HOST_SAC", "loginbp.ppmainecoonghj.com"),
+    "BR":  os.environ.get("HOST_BR",  "loginbp.ppmainecoonghj.com"),
+}
+HOST = HOSTS[REGION]
+
+LOCK_FIELD = int(os.environ.get("LOCK_FIELD", "4"))
+VERBOSE    = bool(os.environ.get("VERBOSE"))
+
+PROXY   = os.environ.get("PROXY") or None
+PROXIES = {"http": PROXY, "https": PROXY} if PROXY else None
+
+UA = f"GarenaMSDK/4.0.42(SM-A525F;Android 12;{LANG};{REGION};)"
 KEY  = bytes.fromhex("32656534343831396539623435393838343531343130363762323831363231383734643064356437616639643866376530306331653534373135623764316533")
 SECRET = KEY.decode()
 
@@ -43,7 +68,8 @@ IV  = bytes([54,111,121,90,68,114,50,50,69,51,121,99,104,106,77,37])
 KS  = [0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,
        0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30]
 
-# Pool de IPs US: X-Forwarded-For es lo que valida el pais, no la IP real del runner.
+# X-Forwarded-For NO fija la region: Garena la resuelve por la conexion TCP.
+# Se mantiene solo como coherencia. Para forzar de verdad: lock_region + host + PROXY.
 US_PREFIX = ("3.80","3.208","4.14","20.0","34.192","52.0","54.208","104.28","172.58","173.245")
 _IPI, _IPL = 0, threading.Lock()
 
@@ -83,7 +109,14 @@ def proto(d): return b"".join(fld(k, v) for k, v in d.items())
 def f14(s): return bytes(ord(c) ^ KS[i % len(KS)] for i, c in enumerate(s))
 def rh(n): return "".join(random.choices("0123456789abcdef", k=n))
 
-STATS = {"attempts": 0, "ok": 0, "err_429": 0, "err_forbidden": 0, "err_other": 0}
+def region_of(token):
+    try:
+        pp = token.split(".")[1]; pp += "=" * (-len(pp) % 4)
+        return (json.loads(base64.urlsafe_b64decode(pp)).get("lock_region") or "").upper()
+    except Exception:
+        return None
+
+STATS = {"attempts": 0, "ok": 0, "err_429": 0, "err_forbidden": 0, "err_region": 0, "err_other": 0}
 SLOCK = threading.Lock()
 RESULTS = []
 STOP = threading.Event()
@@ -92,13 +125,13 @@ def bump(k):
     with SLOCK: STATS[k] += 1
 
 def post(url, ip, retries=3, **kw):
-    """POST con reintentos. Rota IP en cada reintento (429/5xx/400 FORBIDDEN)."""
+    """POST con reintentos. Rota IP y rota proxy en 429 / FORBIDDEN / 5xx."""
     last = None
     for a in range(retries + 1):
         try:
             kw.setdefault("timeout", 15)
             kw["verify"] = False
-            r = requests.post(url, headers=kw.pop("headers", hdr(ip)), **kw)
+            r = requests.post(url, headers=kw.pop("headers", hdr(ip)), proxies=PROXIES, **kw)
             last = r
             if r.status_code == 429:
                 bump("err_429"); time.sleep(2.0 * (a + 1) + random.uniform(0, 1.5))
@@ -115,7 +148,7 @@ def post(url, ip, retries=3, **kw):
 def make_one():
     ip = next_ip()
     try:
-        # 1. registro guest
+        # 1. registro guest (global, independiente de region)
         pw = "Pass_" + "".join(random.choices("0123456789ABCDEF", k=16))
         body = json.dumps({"app_id":100067,"client_type":2,"password":pw,"source":2}, separators=(",",":"))
         sig = hmac.new(KEY, body.encode(), hashlib.sha256).hexdigest()
@@ -125,7 +158,7 @@ def make_one():
         if not r or r.status_code != 200: bump("err_other"); return None
         uid = str(r.json()["data"]["uid"])
 
-        # 2. token
+        # 2. token guest
         r = post("https://100067.connect.garena.com/oauth/guest/token/grant", ip,
                  headers=hdr(ip, **{"Content-Type":"application/x-www-form-urlencoded"}),
                  data={"uid":uid,"password":pw,"response_type":"token","client_type":"2",
@@ -133,9 +166,18 @@ def make_one():
         if not r or r.status_code != 200: bump("err_other"); return None
         j = r.json(); open_id, at = j["open_id"], j["access_token"]
 
-        # 3. MajorRegister (crea la cuenta de juego)
+        # 3. ChooseRegion ANTES de crear la cuenta, con el token guest
+        post(f"https://{HOST}/ChooseRegion", ip,
+             headers={"Host":HOST,"User-Agent":"UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+                      "Accept":"*/*","Authorization":f"Bearer {at}","X-GA":"v1 1","X-Ga-Sv":"1789534056",
+                      "Releaseversion":"OB55","Content-Type":"application/x-www-form-urlencoded",
+                      "X-Unity-Version":"2018.4.12f1","X-Forwarded-For":ip},
+             data=bytes.fromhex(enc(proto({1:REGION}).hex())), retries=2)
+
+        # 4. MajorRegister (crea la cuenta) — aqui se fija lock_region
         name = PREFIX + rh(6).upper()
         msg = {1:name,2:at,3:open_id,5:102000007,6:4,7:1,13:1,14:f14(open_id),15:LANG,16:2,20:"2.132.4",21:1,22:FIELD_22}
+        msg[LOCK_FIELD] = REGION
         r = post(f"https://{HOST}/MajorRegister", ip,
                  headers={"Host":HOST,"User-Agent":"UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
                           "Accept":"*/*","Accept-Encoding":"deflate, gzip","Authorization":"Bearer","X-GA":"v1 1",
@@ -144,7 +186,7 @@ def make_one():
                  data=bytes.fromhex(enc(proto(msg).hex())))
         if not r or r.status_code != 200: bump("err_other"); return None
 
-        # 4. MajorLogin (obtiene account_id real)
+        # 5. MajorLogin (obtiene account_id y el JWT con lock_region)
         lp = {3:datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),4:b"free fire",5:1,7:"2.132.4",
               8:"Android OS 12 / API-31 (SP1A.210812.016)",9:b"Handheld",10:"ATM Mobils",11:"WIFI",
               12:1280,13:720,14:b"240",15:"ARMv8 VFPv4 NEON VMH | 2200 | 8",16:6000,17:"Adreno (TM) 618",
@@ -171,6 +213,7 @@ def make_one():
         second = tok.find(".", tok.find(".") + 1)
         if second == -1: bump("err_other"); return None
         tok = tok[:second + 44]
+
         claims = {}
         try:
             pp = tok.split(".")[1]; pp += "=" * (-len(pp) % 4)
@@ -180,19 +223,16 @@ def make_one():
         acc_id = claims.get("account_id") or claims.get("external_id")
         if not acc_id: bump("err_other"); return None
 
-        # 5. bind US explicito
-        try:
-            post(f"https://{HOST}/ChooseRegion", ip,
-                 headers={"Host":HOST,"User-Agent":"UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
-                          "Accept":"*/*","Authorization":f"Bearer {tok}","X-GA":"v1 1","X-Ga-Sv":"1789534056",
-                          "Releaseversion":"OB55","Content-Type":"application/x-www-form-urlencoded",
-                          "X-Unity-Version":"2018.4.12f1","X-Forwarded-For":ip},
-                 data=bytes.fromhex(enc(proto({1:"US"}).hex())), retries=1)
-        except Exception:
-            pass
+        # 6. GATE: la region del JWT tiene que ser la pedida
+        real = region_of(tok)
+        if real != REGION:
+            bump("err_region")
+            if VERBOSE:
+                print(f"  descartada region={real or '?'} (pedida {REGION})", flush=True)
+            return None
 
         bump("ok")
-        return {"uid": uid, "password": pw, "name": name, "account_id": str(acc_id), "region": "US"}
+        return {"uid": uid, "password": pw, "name": name, "account_id": str(acc_id), "region": real}
     except Exception:
         bump("err_other")
         return None
@@ -207,26 +247,31 @@ def worker():
             with SLOCK:
                 RESULTS.append(acc)
                 n = len(RESULTS)
-            print(f"[{n:02d}] {acc['account_id']} | {acc['uid']} | {acc['password']} | {acc['name']}", flush=True)
+            print(f"[{n:02d}] {acc['uid']} | {acc['password']} | {acc['name']} | {acc['account_id']} | {acc['region']}", flush=True)
             with open(OUT, "a", encoding="utf-8") as f:
                 f.write(f"{acc['uid']}|{acc['password']}|{acc['name']}|{acc['account_id']}\n")
             if n >= COUNT: STOP.set(); return
-        time.sleep(random.uniform(0.3, 0.9))
+        time.sleep(random.uniform(0.6, 1.4))
 
 def main():
     open(OUT, "w").close()
-    print(f"objetivo={COUNT} prefijo={PREFIX} workers={WORKERS}\n")
+    print(f"region={REGION} host={HOST} lang={LANG} lock_field={LOCK_FIELD}")
+    print(f"proxy={'si' if PROXY else 'no'} objetivo={COUNT} prefijo={PREFIX} workers={WORKERS}\n")
+    if LOCK_FIELD in (1,2,3,5,6,7,13,14,15,16,20,21,22):
+        print(f"AVISO: LOCK_FIELD={LOCK_FIELD} colisiona con un campo ya usado en MajorRegister\n")
+
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
         for _ in range(WORKERS): ex.submit(worker)
         while not STOP.is_set():
             time.sleep(0.5)
             with SLOCK:
-                if STATS["attempts"] >= COUNT * 6: STOP.set()
+                if STATS["attempts"] >= max(COUNT * 12, 40): STOP.set()
 
     with SLOCK: s = dict(STATS)
     print(f"\n=== {len(RESULTS)}/{COUNT} cuentas en {time.time()-t0:.0f}s "
-          f"| intentos={s['attempts']} 429={s['err_429']} forbidden={s['err_forbidden']} otros={s['err_other']}")
+          f"| intentos={s['attempts']} 429={s['err_429']} forbidden={s['err_forbidden']} "
+          f"region_mala={s['err_region']} otros={s['err_other']}")
     print(f"archivo: {OUT}")
     if len(RESULTS) < COUNT: sys.exit(1)
 
