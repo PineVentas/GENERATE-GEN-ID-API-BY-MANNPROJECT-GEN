@@ -1,0 +1,43 @@
+name: Diag US
+on:
+  workflow_dispatch:
+    inputs:
+      host:
+        description: "Host de login a probar"
+        default: "login.us.freefiremobile.com"
+        type: string
+      t:
+        description: "Timeout por request (s)"
+        default: "20"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      REGION: US
+      LOCK_FIELD: "4"
+      HOST_US: ${{ inputs.host }}
+      T: ${{ inputs.t }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python diag.py
+      - name: DNS/TLS crudo del runner
+        if: always()
+        run: |
+          getent hosts 100067.connect.garena.com || echo "sin DNS oauth"
+          getent hosts "$HOST_US" || echo "sin DNS host"
+          curl -sS -o /dev/null -w "curl oauth: %{http_code} %{time_total}s\n" \
+            --max-time 20 "https://100067.connect.garena.com/api/v2/oauth/guest:register" || true
+          curl -sSk -o /dev/null -w "curl host: %{http_code} %{time_total}s\n" \
+            --max-time 20 "https://$HOST_US/ChooseRegion" || true
