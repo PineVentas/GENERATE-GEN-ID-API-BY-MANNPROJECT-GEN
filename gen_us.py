@@ -1,20 +1,10 @@
 #!/usr/bin/env python3
-"""Genera cuentas Free Fire por region. Salida: accounts_<region>.txt (uid|pass|name|account_id).
+"""Genera cuentas Free Fire region US. Salida: uid|pass|name|account_id (solo US, verificado por JWT).
 
-Variables de entorno:
-  REGION        US | SAC | BR        (default US)
-  LOCK_FIELD    campo protobuf de lock_region en MajorRegister (default 4)
-  PROXY         http://user:pass@ip:puerto para salir por IP de la region (opcional)
-  COUNT, NAME_PREFIX, WORKERS, OUT_FILE
-  HOST_US / HOST_SAC / HOST_BR   override de host
-  TIMEOUT       segundos por request (default 10)
-  RETRIES       reintentos por request (default 2)
-  MAX_ATTEMPTS  corte duro de intentos (default max(COUNT*5, 30))
-  PROGRESS      segundos entre heartbeats (default 30)
-  PREFLIGHT     1 = chequeo DNS/TLS antes de arrancar (default 1)
-  VERBOSE       1 = log por request (default 0)
+Variables: COUNT, NAME_PREFIX, WORKERS, REGION, LOCK_FIELD, OUT_FILE,
+           PROXY, HOST_US, TIMEOUT, RETRIES, MAX_ATTEMPTS, PROGRESS, PREFLIGHT, VERBOSE
 """
-import os, sys, json, time, random, string, hmac, hashlib, codecs, base64, threading, socket, ssl
+import os, sys, json, time, random, hmac, hashlib, base64, threading, socket, ssl
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import requests, urllib3
@@ -32,8 +22,8 @@ COUNT   = int(os.environ.get("COUNT", "30"))
 PREFIX  = os.environ.get("NAME_PREFIX", "PIP")
 WORKERS = max(1, int(os.environ.get("WORKERS", "2")))
 
-RETRIES      = max(0, int(os.environ.get("RETRIES", "2")))
-TIMEOUT      = float(os.environ.get("TIMEOUT", "10"))
+RETRIES      = max(0, int(os.environ.get("RETRIES", "3")))
+TIMEOUT      = float(os.environ.get("TIMEOUT", "20"))
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", str(max(COUNT * 5, 30))))
 PROGRESS     = float(os.environ.get("PROGRESS", "30"))
 PREFLIGHT    = _bool(os.environ.get("PREFLIGHT", "1"))
@@ -41,17 +31,23 @@ VERBOSE      = _bool(os.environ.get("VERBOSE", "0"))
 
 REGION = os.environ.get("REGION", "US").upper()
 if REGION not in ("US", "SAC", "BR"):
-    log(f"REGION invalida: {REGION} (usa US, SAC o BR)"); sys.exit(2)
+    log(f"REGION invalida: {REGION}"); sys.exit(2)
 LANG = {"US": "en", "SAC": "es", "BR": "pt"}.get(REGION, "en")
 
 OUT = os.environ.get("OUT_FILE", f"accounts_{REGION.lower()}.txt")
 
-HOSTS = {
-    "US":  os.environ.get("HOST_US",  "login.us.freefiremobile.com"),
-    "SAC": os.environ.get("HOST_SAC", "loginbp.ppmainecoonghj.com"),
-    "BR":  os.environ.get("HOST_BR",  "loginbp.ppmainecoonghj.com"),
-}
-HOST = HOSTS[REGION]
+HOST_CANDIDATES = [os.environ.get("HOST_US"), "loginbp.ppmainecoonghj.com", "loginbp.ggblueshark.com"]
+HOST_CANDIDATES = [h for h in HOST_CANDIDATES if h]
+_HI, _HL = 0, threading.Lock()
+HOST = HOST_CANDIDATES[0]
+
+def rotate_host():
+    global _HI, HOST
+    with _HL:
+        _HI += 1
+        HOST = HOST_CANDIDATES[_HI % len(HOST_CANDIDATES)]
+    log(f"[host] rotando a {HOST}")
+    return HOST
 
 LOCK_FIELD = int(os.environ.get("LOCK_FIELD", "4"))
 
@@ -85,8 +81,6 @@ IV  = bytes([54,111,121,90,68,114,50,50,69,51,121,99,104,106,77,37])
 KS  = [0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,
        0x30,0x30,0x30,0x30,0x30,0x32,0x30,0x31,0x37,0x30,0x30,0x30,0x30,0x30,0x32,0x30]
 
-# X-Forwarded-For NO fija la region: Garena la resuelve por la conexion TCP.
-# Se mantiene solo como coherencia. Para forzar de verdad: lock_region + host + PROXY.
 US_PREFIX = ("3.80","3.208","4.14","20.0","34.192","52.0","54.208","104.28","172.58","173.245")
 _IPI, _IPL = 0, threading.Lock()
 
@@ -117,265 +111,4 @@ def varint(n):
         if not n: break
     return bytes(o)
 
-def fld(k, v):
-    if isinstance(v, int): return varint((k << 3) | 0) + varint(v)
-    b = v.encode() if isinstance(v, str) else v
-    return varint((k << 3) | 2) + varint(len(b)) + b
-
-def proto(d): return b"".join(fld(k, v) for k, v in d.items())
-def f14(s): return bytes(ord(c) ^ KS[i % len(KS)] for i, c in enumerate(s))
-def rh(n): return "".join(random.choices("0123456789abcdef", k=n))
-
-def region_of(token):
-    try:
-        pp = token.split(".")[1]; pp += "=" * (-len(pp) % 4)
-        return (json.loads(base64.urlsafe_b64decode(pp)).get("lock_region") or "").upper()
-    except Exception:
-        return None
-
-STATS = {"attempts": 0, "ok": 0, "err_429": 0, "err_forbidden": 0, "err_region": 0,
-         "err_other": 0, "err_timeout": 0, "err_net": 0}
-STEPFAIL = {}
-SLOCK = threading.Lock()
-RESULTS = []
-STOP = threading.Event()
-
-def bump(k):
-    with SLOCK: STATS[k] = STATS.get(k, 0) + 1
-
-def bump_step(step):
-    with SLOCK: STEPFAIL[step] = STEPFAIL.get(step, 0) + 1
-
-def fail(n, step, why, r=None):
-    """Log de fallo SIEMPRE visible, con el cuerpo recortado si hay respuesta."""
-    bump_step(step)
-    extra = ""
-    if r is not None:
-        try: extra = " | " + r.text[:160].replace("\n", " ").replace("\r", " ")
-        except Exception: pass
-    log(f"[-] #{n} {step}: {why}{extra}")
-
-def post(url, ip, retries=None, tag="", **kw):
-    """POST con reintentos acotados. Rota IP en 429 / FORBIDDEN / 5xx / timeout."""
-    retries = RETRIES if retries is None else retries
-    last = None
-    for a in range(retries + 1):
-        try:
-            kw.setdefault("timeout", TIMEOUT)
-            kw["verify"] = False
-            t0 = time.time()
-            r = requests.post(url, headers=kw.pop("headers", hdr(ip)), proxies=PROXIES, **kw)
-            dt = time.time() - t0
-            last = r
-            if VERBOSE:
-                log(f"    {tag} HTTP {r.status_code} {dt:.1f}s")
-            if r.status_code == 429:
-                bump("err_429"); time.sleep(2.0 * (a + 1) + random.uniform(0, 1.5))
-                ip = next_ip(); kw["headers"] = hdr(ip); continue
-            if r.status_code == 400 and b"FORBIDDEN" in (r.content or b""):
-                bump("err_forbidden"); ip = next_ip(); kw["headers"] = hdr(ip); continue
-            if r.status_code in (500, 502, 503, 504, 408):
-                time.sleep(1.0 * (a + 1)); ip = next_ip(); kw["headers"] = hdr(ip); continue
-            return r
-        except requests.exceptions.Timeout:
-            bump("err_timeout")
-            if VERBOSE: log(f"    {tag} TIMEOUT {TIMEOUT}s")
-            time.sleep(0.8 * (a + 1)); ip = next_ip(); kw["headers"] = hdr(ip)
-        except Exception as e:
-            bump("err_net")
-            if VERBOSE: log(f"    {tag} {type(e).__name__}")
-            time.sleep(0.8 * (a + 1)); ip = next_ip(); kw["headers"] = hdr(ip)
-    return last
-
-def make_one(n):
-    ip = next_ip()
-    try:
-        # 1. registro guest (global, independiente de region)
-        pw = "Pass_" + "".join(random.choices("0123456789ABCDEF", k=16))
-        body = json.dumps({"app_id":100067,"client_type":2,"password":pw,"source":2}, separators=(",",":"))
-        sig = hmac.new(KEY, body.encode(), hashlib.sha256).hexdigest()
-        r = post("https://100067.connect.garena.com/api/v2/oauth/guest:register", ip, tag="register",
-                 headers=hdr(ip, **{"Content-Type":"application/json; charset=utf-8","Authorization":f"Signature {sig}"}),
-                 data=body)
-        if not r:
-            fail(n, "register", "sin respuesta (red/timeout)"); bump("err_other"); return None
-        if r.status_code != 200:
-            fail(n, "register", f"HTTP {r.status_code}", r); bump("err_other"); return None
-        uid = str(r.json()["data"]["uid"])
-
-        # 2. token guest
-        r = post("https://100067.connect.garena.com/oauth/guest/token/grant", ip, tag="token",
-                 headers=hdr(ip, **{"Content-Type":"application/x-www-form-urlencoded"}),
-                 data={"uid":uid,"password":pw,"response_type":"token","client_type":"2",
-                       "client_secret":SECRET,"client_id":"100067"})
-        if not r:
-            fail(n, "token", "sin respuesta (red/timeout)"); bump("err_other"); return None
-        if r.status_code != 200:
-            fail(n, "token", f"HTTP {r.status_code}", r); bump("err_other"); return None
-        j = r.json(); open_id, at = j["open_id"], j["access_token"]
-
-        # 3. ChooseRegion ANTES de crear la cuenta, con el token guest
-        r = post(f"https://{HOST}/ChooseRegion", ip, retries=1, tag="choose",
-                 headers={"Host":HOST,"User-Agent":"UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
-                          "Accept":"*/*","Authorization":f"Bearer {at}","X-GA":"v1 1","X-Ga-Sv":"1789534056",
-                          "Releaseversion":"OB55","Content-Type":"application/x-www-form-urlencoded",
-                          "X-Unity-Version":"2018.4.12f1","X-Forwarded-For":ip},
-                 data=bytes.fromhex(enc(proto({1:REGION}).hex())))
-        if not r:
-            fail(n, "choose", "sin respuesta (red/timeout)")
-        elif r.status_code != 200:
-            fail(n, "choose", f"HTTP {r.status_code}", r)
-
-        # 4. MajorRegister (crea la cuenta) — aqui se fija lock_region
-        name = PREFIX + rh(6).upper()
-        msg = {1:name,2:at,3:open_id,5:102000007,6:4,7:1,13:1,14:f14(open_id),15:LANG,16:2,20:"2.132.4",21:1,22:FIELD_22}
-        msg[LOCK_FIELD] = REGION
-        r = post(f"https://{HOST}/MajorRegister", ip, tag="majorreg",
-                 headers={"Host":HOST,"User-Agent":"UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
-                          "Accept":"*/*","Accept-Encoding":"deflate, gzip","Authorization":"Bearer","X-GA":"v1 1",
-                          "ReleaseVersion":"OB55","Content-Type":"application/x-www-form-urlencoded",
-                          "X-Unity-Version":"2018.4.12f1","X-Forwarded-For":ip},
-                 data=bytes.fromhex(enc(proto(msg).hex())))
-        if not r:
-            fail(n, "majorreg", "sin respuesta (red/timeout)"); bump("err_other"); return None
-        if r.status_code != 200:
-            fail(n, "majorreg", f"HTTP {r.status_code}", r); bump("err_other"); return None
-
-        # 5. MajorLogin (obtiene account_id y el JWT con lock_region)
-        lp = {3:datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),4:b"free fire",5:1,7:"2.132.4",
-              8:"Android OS 12 / API-31 (SP1A.210812.016)",9:b"Handheld",10:"ATM Mobils",11:"WIFI",
-              12:1280,13:720,14:b"240",15:"ARMv8 VFPv4 NEON VMH | 2200 | 8",16:6000,17:"Adreno (TM) 618",
-              18:"Adreno (TM) 618|OpenGL ES 3.2",19:f"Google|{rh(8)}-{rh(4)}-{rh(4)}-{rh(4)}-{rh(12)}",
-              20:ip,21:LANG,22:open_id,23:b"4",24:b"Handheld",25:"SM-A525F",26:LANG,29:at,30:1,
-              41:"ATM Mobils",42:"WIFI",57:b"1ac4b80ecf0478a44203bf8fac6120f5",60:30000,61:30000,62:2519,
-              63:243,64:32357,65:34308,66:32357,67:34308,73:1,
-              74:b"/data/app/~~iw-K-GR3srU7dLE-UxJ4bg==/com.dts.freefiremax-kbPhw3SUYautW0I_oayB_A==/lib/arm",76:2,
-              77:b"428775ab8c8845bd341b5357ec61d15e|/data/app/~~iw-K-GR3srU7dLE-UxJ4bg==/com.dts.freefiremax-kbPhw3SUYautW0I_oayB_A==/base.apk",78:2,79:1,
-              81:b"32",83:b"2019118525",85:3,86:b"OpenGLES3",87:4095,88:4,92:19788,93:b"android_max",
-              94:b"KqsHT2gyPt7vUCc9SCjv2ioi3WEZSEL86ErvXB38suVVK/Z4IVt78ESl/r2S15C1pqu/j6ZmgFL7HbwoFiiVconX08ooKiisQffvEAPCo/C+Lahr",
-              96:b'{"cur_rate":null,"support_etc2":true}',97:1,98:1,99:b"4",100:b"4",102:b"",104:77149,105:1,
-              106:b"https://dl.cdn.freefiremobile.com/live/ABHotUpdates/|https://dl-core.cdn.freefiremobile.com/live/ABHotUpdates/|6b2078db9d22dd98f8e9386a39af8462",
-              107:b"c8e41b7a93f02d56e1a94c7b8203f5d1"}
-        r = post(f"https://{HOST}/MajorLogin", ip, tag="majorlogin",
-                 headers={"Host":HOST,"User-Agent":"UnityPlayer/2018.4.12f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
-                          "Accept":"*/*","Accept-Encoding":"deflate, gzip","Authorization":"Bearer","X-GA":"v1 1",
-                          "X-Ga-Sv":"1789534056","ReleaseVersion":"OB55","Content-Type":"application/x-www-form-urlencoded",
-                          "X-Unity-Version":"2018.4.12f1","X-Forwarded-For":ip},
-                 data=bytes.fromhex(enc(proto(lp).hex())))
-        if not r:
-            fail(n, "majorlogin", "sin respuesta (red/timeout)"); bump("err_other"); return None
-        if r.status_code != 200:
-            fail(n, "majorlogin", f"HTTP {r.status_code}", r); bump("err_other"); return None
-
-        tok = r.text[r.text.find("eyJ"):]
-        second = tok.find(".", tok.find(".") + 1)
-        if second == -1:
-            fail(n, "majorlogin", "respuesta sin JWT", r); bump("err_other"); return None
-        tok = tok[:second + 44]
-
-        claims = {}
-        try:
-            pp = tok.split(".")[1]; pp += "=" * (-len(pp) % 4)
-            claims = json.loads(base64.urlsafe_b64decode(pp))
-        except Exception:
-            pass
-        acc_id = claims.get("account_id") or claims.get("external_id")
-        if not acc_id:
-            fail(n, "majorlogin", "JWT sin account_id"); bump("err_other"); return None
-
-        # 6. GATE: la region del JWT tiene que ser la pedida
-        real = region_of(tok)
-        if real != REGION:
-            bump("err_region")
-            if VERBOSE:
-                log(f"  descartada region={real or '?'} (pedida {REGION})")
-            return None
-
-        bump("ok")
-        return {"uid": uid, "password": pw, "name": name, "account_id": str(acc_id), "region": real}
-    except Exception as e:
-        fail(n, "excepcion", f"{type(e).__name__}: {e}")
-        bump("err_other")
-        return None
-
-def worker():
-    while not STOP.is_set():
-        with SLOCK:
-            if STATS["ok"] >= COUNT: STOP.set(); return
-            STATS["attempts"] += 1
-            n = STATS["attempts"]
-        acc = make_one(n)
-        if acc:
-            with SLOCK:
-                RESULTS.append(acc)
-                m = len(RESULTS)
-            log(f"[{m:02d}] {acc['uid']} | {acc['password']} | {acc['name']} | {acc['account_id']} | {acc['region']}")
-            with open(OUT, "a", encoding="utf-8") as f:
-                f.write(f"{acc['uid']}|{acc['password']}|{acc['name']}|{acc['account_id']}\n")
-            if m >= COUNT: STOP.set(); return
-        time.sleep(random.uniform(0.6, 1.4))
-
-def heartbeat(t0):
-    while not STOP.wait(PROGRESS):
-        with SLOCK:
-            s = dict(STATS); ok = len(RESULTS)
-        log(f"[hb] {int(time.time()-t0)}s ok={ok}/{COUNT} intentos={s['attempts']} "
-            f"timeout={s['err_timeout']} net={s['err_net']} 429={s['err_429']} "
-            f"forbidden={s['err_forbidden']} region={s['err_region']} otros={s['err_other']}")
-
-def preflight():
-    """Corta rapido si DNS/TLS no sirven. Evita 25 minutos de nada."""
-    ok = True
-    for tag, host in (("oauth", "100067.connect.garena.com"), ("login", HOST)):
-        try:
-            ips = sorted({ai[4][0] for ai in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)})
-            log(f"[pre] DNS {tag} {host}: {', '.join(ips)}")
-        except Exception as e:
-            log(f"[pre] DNS {tag} {host}: FALLA ({e})"); ok = False; continue
-        try:
-            ctx = ssl._create_unverified_context()
-            with socket.create_connection((host, 443), timeout=TIMEOUT) as s:
-                with ctx.wrap_socket(s, server_hostname=host) as ss:
-                    log(f"[pre] TLS {tag} {host}: OK {ss.version()}")
-        except Exception as e:
-            log(f"[pre] TLS {tag} {host}: FALLA ({type(e).__name__}: {e})")
-            if tag == "login":
-                log("[pre] -> proba HOST_US=loginbp.ggblueshark.com (ggpolarbear ya no resuelve)")
-            ok = False
-    return ok
-
-def main():
-    open(OUT, "w").close()
-    log(f"region={REGION} host={HOST} lang={LANG} lock_field={LOCK_FIELD}")
-    log(f"proxy={'si' if PROXY else 'no'} objetivo={COUNT} prefijo={PREFIX} workers={WORKERS} "
-        f"timeout={TIMEOUT} reintentos={RETRIES} max_intentos={MAX_ATTEMPTS}\n")
-    if LOCK_FIELD in (1,2,3,5,6,7,13,14,15,16,20,21,22):
-        log(f"AVISO: LOCK_FIELD={LOCK_FIELD} colisiona con un campo ya usado en MajorRegister\n")
-
-    if PREFLIGHT and not preflight():
-        log("\nPREFLIGHT FALLO: sin red/TLS hacia los hosts, no tiene sentido generar.")
-        log("Revisa DNS/TLS arriba, o pasa PROXY=... si el bloqueo es por IP de datacenter.")
-        sys.exit(3)
-
-    t0 = time.time()
-    threading.Thread(target=heartbeat, args=(t0,), daemon=True).start()
-
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        for _ in range(WORKERS): ex.submit(worker)
-        while not STOP.is_set():
-            time.sleep(0.5)
-            with SLOCK:
-                if STATS["attempts"] >= MAX_ATTEMPTS: STOP.set()
-
-    with SLOCK:
-        s = dict(STATS); fails = dict(STEPFAIL); ok = len(RESULTS)
-    log(f"\n=== {ok}/{COUNT} cuentas en {time.time()-t0:.0f}s "
-        f"| intentos={s['attempts']} timeout={s['err_timeout']} net={s['err_net']} "
-        f"429={s['err_429']} forbidden={s['err_forbidden']} region_mala={s['err_region']} otros={s['err_other']}")
-    if fails:
-        log("fallos por paso: " + ", ".join(f"{k}={v}" for k, v in sorted(fails.items())))
-    log(f"archivo: {OUT}")
-    if ok < COUNT: sys.exit(1)
-
-if __name__ == "__main__":
-    main()
+def fld
