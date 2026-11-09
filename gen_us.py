@@ -296,9 +296,8 @@ def make_one(n):
             fail(n, "majorlogin", "JWT sin account_id"); bump("err_other"); return None
 
         real = region_of(tok)
-        if real != REGION:
-            bump("err_region")
-            log(f"[-] #{n} descartada region={real or '?'} (pedida {REGION})")
+        OK_REGIONS = ("US", "NA") if REGION == "US" else (REGION,)
+        if real not in OK_REGIONS:
             return None
 
         bump("ok")
