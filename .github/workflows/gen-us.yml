@@ -39,13 +39,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      COUNT: ${{ inputs.count || '30' }}
-      NAME_PREFIX: ${{ inputs.prefix || 'PIP' }}
-      WORKERS: ${{ inputs.workers || '4' }}
-      REGION: US
-      LOCK_FIELD: "4"
-      OUT_FILE: accounts_us.txt
-      PYTHONUNBUFFERED: "1"
+      COUNT: "5"            # prueba corta primero
+      WORKERS: "2"          # 2, no 4: una sola IP
+      TIMEOUT: "20"
+      RETRIES: "3"
+      HOST_US: loginbp.ppmainecoonghj.com
     steps:
       - uses: actions/checkout@v4
 
