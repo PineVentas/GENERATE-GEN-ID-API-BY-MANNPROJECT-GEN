@@ -27,9 +27,9 @@ jobs:
       COUNT: ${{ inputs.count || '5' }}
       NAME_PREFIX: ${{ inputs.prefix || 'PIP' }}
       WORKERS: ${{ inputs.workers || '2' }}
-      REGION: SAC
+      REGION: US
       LOCK_FIELD: "4"
-      TIMEOUT: "20"
+      TIMEOUT: "40"
       RETRIES: "3"
       OUT_FILE: accounts_us.txt
       PYTHONUNBUFFERED: "1"
